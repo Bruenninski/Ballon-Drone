@@ -2,6 +2,9 @@
 #include <ArduinoJson.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include <TinyGPSPlus.h>
+#include <SoftwareSerial.h>
+
 #include <string.h>
 
 #include"credentials.h"
@@ -11,6 +14,7 @@ enum MqttTopic{
   led_on,
   led_off,
   motor_full,
+  publish_gps,
   led_unknown
   };
 
@@ -21,6 +25,16 @@ struct MotorStatus {
   uint16_t motor2_speed;
 };
 
+struct Position
+{
+  double longitude;
+  double latitude;
+  Position(double lat, double lon) : latitude(lat), longitude(lon){}
+};
+
+
+
+
 void switchLedOn();
 void switchLedOff();
 void reconnect();
@@ -30,9 +44,23 @@ MqttTopic decodeTopic(char* topic);
 void fillMotorStatus(MotorStatus&, JsonDocument);
 void controlMotor(MotorStatus&);
 int correctedMotorSpeed(uint16_t speed);
+void gpsTimerCallback(void*);
 
 WiFiClient espClient;
 PubSubClient client(espClient);
+Position startPosition(0,0);
+
+
+TinyGPSPlus gps;
+SoftwareSerial gpsSer(config::GPS_RX, config::GPS_TX);
+os_timer_t gpsTimer;
+volatile bool gpsCaptureFlag = false;
+
+
+void gpsTimerCallback(void*)
+{
+  gpsCaptureFlag = true;
+}
 
 void fillMotorStatus(MotorStatus& status, JsonDocument json)
 {
@@ -80,12 +108,65 @@ void setup()
   digitalWrite(config::MOTOR_TWO, LOW);
 
   Serial.begin(config::BAUD_RATE);
+  gpsSer.begin(config::GT_U7_BAUD_RATE);
 
   setup_wifi();
+
+  os_timer_setfn(&gpsTimer, gpsTimerCallback, NULL);
+  os_timer_arm(&gpsTimer, config::GPS_TIMER_ms, true);
 
   //MQTT setup
   client.setServer(config::mqtt_server, config::MQTT_PORT);
   client.setCallback(callback);
+}
+
+
+void publishGPSValue()
+{
+
+  if (gps.location.isValid())
+  {
+    JsonDocument doc;
+    double lat = gps.location.lat();
+    double lon = gps.location.lng();
+    String payload = "coordinates: " + String(lat) + " : " + String(lon);
+    doc["latitude"] = lat;
+    doc["longitude"] = lon;
+
+    Serial.println(payload);
+    char jsonBuffer[512];
+    serializeJson(doc, jsonBuffer);
+    client.publish(config::MQTT_GPS_PUB, jsonBuffer);
+
+
+    //if it is the first connection, take it as start position
+    if(startPosition.longitude == 0. && startPosition.latitude == 0.)
+    {
+      startPosition.longitude = lon;
+      startPosition.latitude = lat;
+    }
+
+    auto distance_m = gps.distanceBetween(lat, lon, startPosition.latitude, startPosition.longitude);
+    if (distance_m > config::distanceBeforeTurnaround_m)
+    {
+      auto speed = gps.speed.kmph();
+      MotorStatus motor;
+      motor.motor1_on = true;
+      motor.motor2_on = true;
+      motor.motor1_speed = 100;
+      motor.motor2_speed = 20;
+      controlMotor(motor);
+      //todo: how do we turn around
+    }
+  }
+}
+
+void gpsloop()
+{
+   while (gpsSer.available() > 0) 
+  {
+    gps.encode( gpsSer.read());
+  }
 }
 
 void loop() 
@@ -94,11 +175,19 @@ void loop()
     reconnect();
   }
 
+  if(gpsCaptureFlag)
+  {
+    gpsCaptureFlag = false;
+    publishGPSValue();   
+  }
+  
+  gpsloop();  
   client.loop();
 }
 
 MqttTopic decodeTopic(char* topic)
 { 
+  Serial.println("decode");
   if(strcmp(topic, config::MQTT_LED_ON) == 0)
   {
     return led_on;
@@ -112,8 +201,14 @@ MqttTopic decodeTopic(char* topic)
   {
     return motor_full;
   }
+   if(strcmp(topic, config::MQTT_GPS_SUB) == 0)
+  {
+    return publish_gps;
+  }
   return led_unknown;
 }
+
+
 
 void switchLedOn()
 {
@@ -145,7 +240,8 @@ void callback(char* topic, byte* message, unsigned int length)
   MqttTopic result = decodeTopic(topic);
 
   switch(result){
-    case led_on:{
+    case led_on:
+    {
       switchLedOn();
       break;
     }
@@ -154,7 +250,8 @@ void callback(char* topic, byte* message, unsigned int length)
       switchLedOff();
       break;
     }
-    case motor_full:{
+    case motor_full:
+    {
       JsonDocument doc;
       MotorStatus status;
 
@@ -167,6 +264,12 @@ void callback(char* topic, byte* message, unsigned int length)
         
       fillMotorStatus(status, doc);
       controlMotor(status);
+      break;
+    }
+    case publish_gps:
+    {
+      Serial.println("publish gps");
+      publishGPSValue();
       break;
     }
     case led_unknown:
@@ -183,9 +286,11 @@ void reconnect()
   {  
     if (client.connect("ESP8266Client")) 
     {
+      client.subscribe(config::MQTT_GPS_SUB);
       client.subscribe(config::MQTT_LED_ON);
       client.subscribe(config::MQTT_LED_OFF);
       client.subscribe(config::MQTT_MOTOR_COMMAND);
+      
     } 
     else 
     {
